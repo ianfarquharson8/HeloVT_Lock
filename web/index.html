@@ -1,7 +1,9 @@
 <!doctype html>
 <!--
-  Web version of laptop_app.py: toggle the XIAO nRF52840's LED + D0 over BLE,
-  and show the board's internal time and its connect/disconnect log.
+  Web version of laptop_app.py: unlock the HeloVT lock (XIAO nRF52840) over BLE,
+  and show the board's internal time and its event log.
+  Commands are signed with the secret key from lock_key.txt (see xiao_led_ble.ino for the protocol).
+  The key is entered on the page and saved in this browser only.
   Uses Web Bluetooth, so it needs Chrome or Edge (Brave needs brave://flags/#brave-web-bluetooth-api).
 
   Run (from the project folder):  python -m http.server 8000 --directory web
@@ -11,7 +13,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>XIAO Lock Control</title>
+<title>HeloVT Lock</title>
 <style>
   :root { color-scheme: light dark; }
   body {
@@ -42,16 +44,26 @@
   .evt-connect { color: #2e7d32; }
   .evt-disconnect { color: #c62828; }
   .evt-boot { color: #1565c0; }
+  .evt-unlock { color: #ef6c00; }
+  .evt-fail { color: #c62828; font-weight: 600; }
+  .key-row { display: flex; gap: 8px; margin-bottom: 16px; }
+  .key-row input { flex: 1; min-width: 0; font-family: ui-monospace, monospace; padding: 8px; }
+  .key-row button { width: auto; margin: 0; padding: 8px 14px; font-size: 0.95rem; }
   .hint { color: gray; font-size: 0.85rem; text-align: left; }
   tr.pending td { font-style: italic; }
 </style>
 </head>
 <body>
 <div class="card">
-  <h1>XIAO Lock Control</h1>
+  <h1>HeloVT Lock</h1>
+  <div class="key-row">
+    <input id="key" type="password" placeholder="Lock key (64 hex characters from lock_key.txt)"
+           autocomplete="off" spellcheck="false">
+    <button id="saveKey">Save</button>
+  </div>
   <p id="status">Disconnected</p>
   <button id="connect">Connect</button>
-  <button id="toggle" disabled>Turn LED ON</button>
+  <button id="toggle" disabled>Unlock</button>
   <button id="pickOther" class="link" hidden>Pick a different board</button>
 
   <div class="clock">
@@ -59,7 +71,7 @@
     <div id="uptimeNote">Board internal time (since power-on)</div>
   </div>
 
-  <h2>Connection log</h2>
+  <h2>Event log</h2>
   <table>
     <thead><tr><th>Event</th><th>Board time</th><th>Clock time</th><th>Notes</th></tr></thead>
     <tbody id="log"><tr><td colspan="4" class="hint">Connect to load the log.</td></tr></tbody>
@@ -72,14 +84,24 @@
 
 <script>
 // These must match the UUIDs in xiao_led_ble.ino
-const DEVICE_NAME = "XIAO-LED";
-const SERVICE_UUID = "19b10000-e8f2-537e-4f6c-d104768a1214";
-const LED_CHAR_UUID = "19b10001-e8f2-537e-4f6c-d104768a1214";
-const UPTIME_CHAR_UUID = "19b10002-e8f2-537e-4f6c-d104768a1214";
-const LOG_CHAR_UUID = "19b10003-e8f2-537e-4f6c-d104768a1214";
+const DEVICE_NAME = "HeloVT-Lock";
+const SERVICE_UUID = "19b10100-e8f2-537e-4f6c-d104768a1214";
+const STATE_CHAR_UUID = "19b10101-e8f2-537e-4f6c-d104768a1214";
+const UPTIME_CHAR_UUID = "19b10102-e8f2-537e-4f6c-d104768a1214";
+const LOG_CHAR_UUID = "19b10103-e8f2-537e-4f6c-d104768a1214";
+const NONCE_CHAR_UUID = "19b10104-e8f2-537e-4f6c-d104768a1214";
+const COMMAND_CHAR_UUID = "19b10105-e8f2-537e-4f6c-d104768a1214";
 
-const EVENT_NAMES = { 0: "Boot", 1: "Connected", 2: "Disconnected" };
-const EVENT_CLASSES = { 0: "evt-boot", 1: "evt-connect", 2: "evt-disconnect" };
+const CMD_LOCK = 0, CMD_UNLOCK = 1;
+const RES_OK = 1;
+const RESULT_TEXT = {
+  0: "no command yet", 1: "OK", 2: "rejected: wrong key",
+  3: "rejected: too many bad attempts, wait 30s", 4: "rejected: bad command",
+};
+
+const EVENT_NAMES = { 0: "Boot", 1: "Connected", 2: "Disconnected", 3: "Unlocked", 4: "Locked", 5: "Bad key attempt" };
+const EVENT_CLASSES = { 0: "evt-boot", 1: "evt-connect", 2: "evt-disconnect", 3: "evt-unlock", 5: "evt-fail" };
+const KEY_STORAGE_KEY = "heloVTLockKey";
 
 const statusEl = document.getElementById("status");
 const connectBtn = document.getElementById("connect");
@@ -88,10 +110,15 @@ const pickOtherBtn = document.getElementById("pickOther");
 const uptimeEl = document.getElementById("uptime");
 const uptimeNoteEl = document.getElementById("uptimeNote");
 const logEl = document.getElementById("log");
+const keyInput = document.getElementById("key");
 
 let device = null;
-let ledChar = null;
-let ledOn = false;
+let nonceChar = null;
+let commandChar = null;
+let unlocked = false;
+let hmacKey = null;  // CryptoKey for signing commands
+// Resolves when the board notifies State after a command
+let stateWaiter = null;
 
 // Last uptime received from the board, and when (page clock) we received it
 let boardUptimeMs = null;
@@ -141,8 +168,49 @@ function formatDuration(ms) {
 }
 
 function updateToggle() {
-  toggleBtn.textContent = ledOn ? "Turn LED OFF" : "Turn LED ON";
-  toggleBtn.classList.toggle("on", ledOn);
+  toggleBtn.textContent = unlocked ? "Lock now" : "Unlock";
+  toggleBtn.classList.toggle("on", unlocked);
+}
+
+function showState(result) {
+  updateToggle();
+  const text = `Connected to ${device.name} - ${unlocked ? "UNLOCKED (relocks automatically)" : "Locked"}`;
+  if (result !== undefined && result !== RES_OK) {
+    setStatus(`${text} - ${RESULT_TEXT[result] || `error ${result}`}`, "red");
+  } else {
+    setStatus(text, "green");
+  }
+}
+
+// Board notified State: [lock state][result of last command]
+function onState(dataView) {
+  unlocked = dataView.getUint8(0) !== 0;
+  const result = dataView.getUint8(1);
+  if (stateWaiter) {
+    stateWaiter(result);
+    stateWaiter = null;
+  } else {
+    showState();  // board-initiated, e.g. the auto-relock
+  }
+}
+
+async function loadKey(hex) {
+  hex = hex.trim().toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(hex)) throw new Error("The key must be 64 hex characters (from lock_key.txt).");
+  const bytes = new Uint8Array(hex.match(/../g).map((b) => parseInt(b, 16)));
+  hmacKey = await crypto.subtle.importKey("raw", bytes, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+}
+
+async function saveKey() {
+  try {
+    await loadKey(keyInput.value);
+    try { localStorage.setItem(KEY_STORAGE_KEY, keyInput.value.trim()); } catch {}
+    keyInput.value = "";
+    keyInput.placeholder = "Key saved in this browser";
+    if (!statusEl.textContent.startsWith("Connected")) setStatus("Key saved.");
+  } catch (err) {
+    setStatus(err.message, "red");
+  }
 }
 
 // Between board updates (and while disconnected), count forward on the page's clock
@@ -232,8 +300,9 @@ function onDisconnected() {
     renderLog();
   }
 
-  ledChar = null;
-  ledOn = false;
+  nonceChar = commandChar = null;
+  stateWaiter = null;
+  unlocked = false;
   updateToggle();
   toggleBtn.disabled = true;
   connectBtn.textContent = "Reconnect";
@@ -246,6 +315,10 @@ function onDisconnected() {
 async function connect(pickNew) {
   if (!navigator.bluetooth) {
     setStatus("Web Bluetooth not supported. Use Chrome or Edge.", "red");
+    return;
+  }
+  if (!hmacKey) {
+    setStatus("Enter the lock key first.", "red");
     return;
   }
   connectBtn.disabled = true;
@@ -266,12 +339,16 @@ async function connect(pickNew) {
     setStatus("Connecting...", "orange");
     const server = await device.gatt.connect();
     const service = await server.getPrimaryService(SERVICE_UUID);
-    ledChar = await service.getCharacteristic(LED_CHAR_UUID);
+    const stateChar = await service.getCharacteristic(STATE_CHAR_UUID);
     const uptimeChar = await service.getCharacteristic(UPTIME_CHAR_UUID);
     const logChar = await service.getCharacteristic(LOG_CHAR_UUID);
+    nonceChar = await service.getCharacteristic(NONCE_CHAR_UUID);
+    commandChar = await service.getCharacteristic(COMMAND_CHAR_UUID);
 
-    ledOn = (await ledChar.readValue()).getUint8(0) !== 0;
+    unlocked = (await stateChar.readValue()).getUint8(0) !== 0;
     updateToggle();
+    stateChar.addEventListener("characteristicvaluechanged", (e) => onState(e.target.value));
+    await stateChar.startNotifications();
 
     // Read uptime first so clock times for the log are anchored correctly
     const uptime = (await uptimeChar.readValue()).getUint32(0, true);
@@ -286,7 +363,7 @@ async function connect(pickNew) {
     toggleBtn.disabled = false;
     connectBtn.textContent = "Disconnect";
     connectBtn.disabled = false;
-    setStatus(`Connected to ${device.name} - LED ${ledOn ? "ON" : "OFF"}`, "green");
+    showState();
   } catch (err) {
     connectBtn.disabled = false;
     pickOtherBtn.hidden = !device;
@@ -294,19 +371,29 @@ async function connect(pickNew) {
   }
 }
 
+// Sign the command with the board's current nonce: [cmd][HMAC-SHA256(key, nonce || cmd)]
+async function sendCommand(cmd) {
+  const nonce = new Uint8Array((await nonceChar.readValue()).buffer);
+  const msg = new Uint8Array([...nonce, cmd]);
+  const mac = new Uint8Array(await crypto.subtle.sign("HMAC", hmacKey, msg));
+  const reply = new Promise((resolve, reject) => {
+    stateWaiter = resolve;
+    setTimeout(() => reject(new Error("no reply from the lock")), 3000);
+  });
+  await commandChar.writeValueWithResponse(new Uint8Array([cmd, ...mac]));
+  return reply;
+}
+
 async function toggle() {
-  const target = !ledOn;
   toggleBtn.disabled = true;
   setStatus("Sending...", "orange");
   try {
-    await ledChar.writeValueWithResponse(new Uint8Array([target ? 1 : 0]));
-    ledOn = target;
-    updateToggle();
-    setStatus(`Connected to ${device.name} - LED ${ledOn ? "ON" : "OFF"}`, "green");
+    showState(await sendCommand(unlocked ? CMD_LOCK : CMD_UNLOCK));
   } catch (err) {
+    stateWaiter = null;
     setStatus(`Error: ${err.message}`, "red");
   } finally {
-    if (ledChar) toggleBtn.disabled = false;
+    if (commandChar) toggleBtn.disabled = false;
   }
 }
 
@@ -316,6 +403,8 @@ connectBtn.addEventListener("click", () => {
 });
 pickOtherBtn.addEventListener("click", () => connect(true));
 toggleBtn.addEventListener("click", toggle);
+document.getElementById("saveKey").addEventListener("click", saveKey);
+keyInput.addEventListener("keydown", (e) => { if (e.key === "Enter") saveKey(); });
 document.getElementById("clearLog").addEventListener("click", () => {
   if (!confirm("Clear the website's connection history?")) return;
   history = { sessions: [], pending: [] };
@@ -325,6 +414,10 @@ document.getElementById("clearLog").addEventListener("click", () => {
 
 loadHistory();
 renderLog();
+try {
+  const savedKey = localStorage.getItem(KEY_STORAGE_KEY);
+  if (savedKey) loadKey(savedKey).then(() => { keyInput.placeholder = "Key saved in this browser"; }, () => {});
+} catch {}
 </script>
 </body>
 </html>

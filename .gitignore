@@ -1,2 +1,6 @@
 __pycache__/
 *.pyc
+
+# Secret lock key (created by make_key.py)
+lock_key.txt
+xiao_led_ble/secret.h
