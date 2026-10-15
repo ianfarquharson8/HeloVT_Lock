@@ -1,0 +1,330 @@
+<!doctype html>
+<!--
+  Web version of laptop_app.py: toggle the XIAO nRF52840's LED + D0 over BLE,
+  and show the board's internal time and its connect/disconnect log.
+  Uses Web Bluetooth, so it needs Chrome or Edge (Brave needs brave://flags/#brave-web-bluetooth-api).
+
+  Run (from the project folder):  python -m http.server 8000 --directory web
+  Then open:                      http://localhost:8000
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>XIAO Lock Control</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font-family: system-ui, sans-serif;
+    display: flex; justify-content: center;
+    margin: 0; padding: 32px 16px; box-sizing: border-box;
+  }
+  .card { text-align: center; max-width: 480px; width: 100%; }
+  #status { margin: 0 0 20px; color: gray; min-height: 1.4em; }
+  button {
+    font-size: 1.1rem; padding: 14px 20px; width: 100%; margin-bottom: 10px;
+    border-radius: 8px; border: 1px solid #888; cursor: pointer;
+  }
+  button:disabled { opacity: 0.5; cursor: default; }
+  button.link {
+    font-size: 0.9rem; padding: 4px; border: none; background: none;
+    text-decoration: underline; color: gray; width: auto;
+  }
+  #toggle.on { background: #2e7d32; color: white; border-color: #2e7d32; }
+  .clock { margin: 24px 0 8px; }
+  #uptime { font-size: 2rem; font-variant-numeric: tabular-nums; font-family: ui-monospace, monospace; }
+  #uptimeNote { color: gray; font-size: 0.85rem; }
+  h2 { font-size: 1.1rem; margin: 28px 0 8px; text-align: left; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.95rem; text-align: left; }
+  th, td { padding: 6px 8px; border-bottom: 1px solid #8884; }
+  th { color: gray; font-weight: 500; }
+  td.time { font-family: ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+  .evt-connect { color: #2e7d32; }
+  .evt-disconnect { color: #c62828; }
+  .evt-boot { color: #1565c0; }
+  .hint { color: gray; font-size: 0.85rem; text-align: left; }
+  tr.pending td { font-style: italic; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>XIAO Lock Control</h1>
+  <p id="status">Disconnected</p>
+  <button id="connect">Connect</button>
+  <button id="toggle" disabled>Turn LED ON</button>
+  <button id="pickOther" class="link" hidden>Pick a different board</button>
+
+  <div class="clock">
+    <div id="uptime">--:--:--.-</div>
+    <div id="uptimeNote">Board internal time (since power-on)</div>
+  </div>
+
+  <h2>Connection log</h2>
+  <table>
+    <thead><tr><th>Event</th><th>Board time</th><th>Clock time</th><th>Notes</th></tr></thead>
+    <tbody id="log"><tr><td colspan="4" class="hint">Connect to load the log.</td></tr></tbody>
+  </table>
+  <p class="hint">Newest first. The website keeps its own history (saved in this browser), so it
+    survives page refreshes and board resets. Disconnects show up instantly; rows marked "recorded by
+    website" are replaced by the board's own record when you reconnect.</p>
+  <button id="clearLog" class="link">Clear website log</button>
+</div>
+
+<script>
+// These must match the UUIDs in xiao_led_ble.ino
+const DEVICE_NAME = "XIAO-LED";
+const SERVICE_UUID = "19b10000-e8f2-537e-4f6c-d104768a1214";
+const LED_CHAR_UUID = "19b10001-e8f2-537e-4f6c-d104768a1214";
+const UPTIME_CHAR_UUID = "19b10002-e8f2-537e-4f6c-d104768a1214";
+const LOG_CHAR_UUID = "19b10003-e8f2-537e-4f6c-d104768a1214";
+
+const EVENT_NAMES = { 0: "Boot", 1: "Connected", 2: "Disconnected" };
+const EVENT_CLASSES = { 0: "evt-boot", 1: "evt-connect", 2: "evt-disconnect" };
+
+const statusEl = document.getElementById("status");
+const connectBtn = document.getElementById("connect");
+const toggleBtn = document.getElementById("toggle");
+const pickOtherBtn = document.getElementById("pickOther");
+const uptimeEl = document.getElementById("uptime");
+const uptimeNoteEl = document.getElementById("uptimeNote");
+const logEl = document.getElementById("log");
+
+let device = null;
+let ledChar = null;
+let ledOn = false;
+
+// Last uptime received from the board, and when (page clock) we received it
+let boardUptimeMs = null;
+let boardUptimeAt = 0;
+
+// The website's own history, saved in localStorage. Every event has a wall-clock time.
+//   sessions: one per board power-on (identified by the wall-clock time it booted),
+//             holding the events read from the board's log
+//   pending:  disconnects the website saw itself that the board hasn't confirmed yet
+const STORAGE_KEY = "xiaoLockLog";
+// Boot times within this much of each other are treated as the same board session
+const SAME_BOOT_TOLERANCE_MS = 5000;
+let history = { sessions: [], pending: [] };
+
+function loadHistory() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
+    if (saved && Array.isArray(saved.sessions)) history = saved;
+  } catch {}
+}
+
+function saveHistory() {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(history)); } catch {}
+}
+
+function setStatus(text, color = "gray") {
+  statusEl.textContent = text;
+  statusEl.style.color = color;
+}
+
+// ms -> "HH:MM:SS.s"
+function formatTime(ms) {
+  const totalSec = Math.floor(ms / 1000);
+  const h = String(Math.floor(totalSec / 3600)).padStart(2, "0");
+  const m = String(Math.floor(totalSec / 60) % 60).padStart(2, "0");
+  const s = String(totalSec % 60).padStart(2, "0");
+  return `${h}:${m}:${s}.${Math.floor(ms / 100) % 10}`;
+}
+
+// ms -> "1h 2m 3.4s" style duration
+function formatDuration(ms) {
+  const sec = ms / 1000;
+  if (sec < 60) return `${sec.toFixed(1)}s`;
+  const m = Math.floor(sec / 60), s = Math.floor(sec % 60);
+  if (m < 60) return `${m}m ${s}s`;
+  return `${Math.floor(m / 60)}h ${m % 60}m ${s}s`;
+}
+
+function updateToggle() {
+  toggleBtn.textContent = ledOn ? "Turn LED OFF" : "Turn LED ON";
+  toggleBtn.classList.toggle("on", ledOn);
+}
+
+// Between board updates (and while disconnected), count forward on the page's clock
+function estimatedUptime() {
+  return boardUptimeMs + (performance.now() - boardUptimeAt);
+}
+
+function tickClock() {
+  if (boardUptimeMs !== null) uptimeEl.textContent = formatTime(estimatedUptime());
+}
+
+function formatClock(wall) {
+  const d = new Date(wall);
+  const today = d.toDateString() === new Date().toDateString();
+  return today ? d.toLocaleTimeString() : d.toLocaleString();
+}
+setInterval(tickClock, 100);
+
+function onUptime(ms) {
+  boardUptimeMs = ms;
+  boardUptimeAt = performance.now();
+  uptimeNoteEl.textContent = "Board internal time (since power-on) - live";
+  tickClock();
+}
+
+function parseBoardLog(dataView) {
+  const events = [];
+  for (let i = 0; i + 5 <= dataView.byteLength; i += 5) {
+    events.push({ type: dataView.getUint8(i), ms: dataView.getUint32(i + 1, true) });
+  }
+  return events;
+}
+
+// Fold a freshly read board log into the website's history
+function mergeBoardLog(dataView, uptime) {
+  const bootWall = Date.now() - uptime;
+  const events = parseBoardLog(dataView).map((e) => ({ ...e, wall: bootWall + e.ms }));
+  const last = history.sessions[history.sessions.length - 1];
+
+  if (last && Math.abs(last.bootWall - bootWall) < SAME_BOOT_TOLERANCE_MS) {
+    // Same board session: the board's log now covers our pending disconnects.
+    // Keep anything older than the board's ring buffer still holds.
+    const oldestOnBoard = events.length ? events[0].ms : Infinity;
+    last.events = [...last.events.filter((e) => e.ms < oldestOnBoard), ...events];
+  } else {
+    // Board was reset since we last saw it: its old log is gone, so keep the
+    // website's disconnect records as the only copy.
+    if (last) {
+      last.events.push(...history.pending.map((e) => ({ ...e, pending: false, websiteOnly: true })));
+    }
+    history.sessions.push({ bootWall, events });
+  }
+  history.pending = [];
+  saveHistory();
+}
+
+function renderLog() {
+  const events = history.sessions.flatMap((s) => s.events)
+    .concat(history.pending)
+    .sort((a, b) => a.wall - b.wall);
+
+  const rows = events.map((e, i) => {
+    const prev = events[i - 1];
+    const notes = [];
+    if (e.type === 0) notes.push("Board powered on / reset");
+    else if (e.type === 1 && prev && prev.type === 2) notes.push(`Reconnected after ${formatDuration(e.wall - prev.wall)}`);
+    else if (e.type === 1 && prev && prev.type === 0) notes.push("First connection since boot");
+    else if (e.type === 2 && prev && prev.type === 1) notes.push(`Was connected for ${formatDuration(e.wall - prev.wall)}`);
+    if (e.pending) notes.push("recorded by website, board's record syncs on reconnect");
+    if (e.websiteOnly) notes.push("recorded by website only (board was reset before it synced)");
+    const estimated = e.pending || e.websiteOnly;
+    return `<tr class="${estimated ? "pending" : ""}">` +
+           `<td class="${EVENT_CLASSES[e.type] || ""}">${EVENT_NAMES[e.type] || `Unknown (${e.type})`}</td>` +
+           `<td class="time">${formatTime(e.ms)}${estimated ? " (est.)" : ""}</td>` +
+           `<td class="time">${formatClock(e.wall)}</td><td>${notes.join(" · ")}</td></tr>`;
+  });
+
+  logEl.innerHTML = rows.reverse().join("") ||
+    `<tr><td colspan="4" class="hint">No events.</td></tr>`;
+}
+
+function onDisconnected() {
+  // Record the disconnect on the website immediately
+  if (boardUptimeMs !== null) {
+    history.pending.push({ type: 2, ms: estimatedUptime(), wall: Date.now(), pending: true });
+    saveHistory();
+    renderLog();
+  }
+
+  ledChar = null;
+  ledOn = false;
+  updateToggle();
+  toggleBtn.disabled = true;
+  connectBtn.textContent = "Reconnect";
+  connectBtn.disabled = false;
+  pickOtherBtn.hidden = false;
+  uptimeNoteEl.textContent = "Board internal time (since power-on) - estimated, disconnected";
+  setStatus("Disconnected");
+}
+
+async function connect(pickNew) {
+  if (!navigator.bluetooth) {
+    setStatus("Web Bluetooth not supported. Use Chrome or Edge.", "red");
+    return;
+  }
+  connectBtn.disabled = true;
+  pickOtherBtn.hidden = true;
+  try {
+    // Reuse the board picked earlier on this page, so reconnecting skips the picker
+    if (pickNew || !device) {
+      setStatus("Choose the device in the popup...", "orange");
+      const picked = await navigator.bluetooth.requestDevice({
+        filters: [{ name: DEVICE_NAME }],
+        optionalServices: [SERVICE_UUID],
+      });
+      if (device) device.removeEventListener("gattserverdisconnected", onDisconnected);
+      device = picked;
+      device.addEventListener("gattserverdisconnected", onDisconnected);
+    }
+
+    setStatus("Connecting...", "orange");
+    const server = await device.gatt.connect();
+    const service = await server.getPrimaryService(SERVICE_UUID);
+    ledChar = await service.getCharacteristic(LED_CHAR_UUID);
+    const uptimeChar = await service.getCharacteristic(UPTIME_CHAR_UUID);
+    const logChar = await service.getCharacteristic(LOG_CHAR_UUID);
+
+    ledOn = (await ledChar.readValue()).getUint8(0) !== 0;
+    updateToggle();
+
+    // Read uptime first so clock times for the log are anchored correctly
+    const uptime = (await uptimeChar.readValue()).getUint32(0, true);
+    onUptime(uptime);
+    mergeBoardLog(await logChar.readValue(), uptime);
+    renderLog();
+
+    uptimeChar.addEventListener("characteristicvaluechanged",
+      (e) => onUptime(e.target.value.getUint32(0, true)));
+    await uptimeChar.startNotifications();
+
+    toggleBtn.disabled = false;
+    connectBtn.textContent = "Disconnect";
+    connectBtn.disabled = false;
+    setStatus(`Connected to ${device.name} - LED ${ledOn ? "ON" : "OFF"}`, "green");
+  } catch (err) {
+    connectBtn.disabled = false;
+    pickOtherBtn.hidden = !device;
+    setStatus(`Error: ${err.message}`, "red");
+  }
+}
+
+async function toggle() {
+  const target = !ledOn;
+  toggleBtn.disabled = true;
+  setStatus("Sending...", "orange");
+  try {
+    await ledChar.writeValueWithResponse(new Uint8Array([target ? 1 : 0]));
+    ledOn = target;
+    updateToggle();
+    setStatus(`Connected to ${device.name} - LED ${ledOn ? "ON" : "OFF"}`, "green");
+  } catch (err) {
+    setStatus(`Error: ${err.message}`, "red");
+  } finally {
+    if (ledChar) toggleBtn.disabled = false;
+  }
+}
+
+connectBtn.addEventListener("click", () => {
+  if (device && device.gatt.connected) device.gatt.disconnect();
+  else connect(false);
+});
+pickOtherBtn.addEventListener("click", () => connect(true));
+toggleBtn.addEventListener("click", toggle);
+document.getElementById("clearLog").addEventListener("click", () => {
+  if (!confirm("Clear the website's connection history?")) return;
+  history = { sessions: [], pending: [] };
+  saveHistory();
+  renderLog();
+});
+
+loadHistory();
+renderLog();
+</script>
+</body>
+</html>
