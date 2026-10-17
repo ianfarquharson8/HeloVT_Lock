@@ -94,6 +94,7 @@ const COMMAND_CHAR_UUID = "19b10105-e8f2-537e-4f6c-d104768a1214";
 
 const CMD_LOCK = 0, CMD_UNLOCK = 1;
 const RES_OK = 1;
+const LATCH_OPEN = 0, LATCH_NOT_FITTED = 0xff;
 const RESULT_TEXT = {
   0: "no command yet", 1: "OK", 2: "rejected: wrong key",
   4: "rejected: bad command", 5: "solenoid cooling down, try again shortly",
@@ -119,6 +120,7 @@ let device = null;
 let nonceChar = null;
 let commandChar = null;
 let unlocked = false;
+let latch = LATCH_NOT_FITTED;
 let hmacKey = null;  // CryptoKey for signing commands
 // Resolves when the board notifies State after a command
 let stateWaiter = null;
@@ -177,18 +179,32 @@ function updateToggle() {
 
 function showState(result) {
   updateToggle();
-  const text = `Connected to ${device.name} - ${unlocked ? "UNLOCKED (relocks automatically)" : "Locked"}`;
+  let lockText = "Locked", color = "green";
+  if (unlocked) {
+    lockText = "UNLOCKED (relocks automatically)";
+  } else if (latch === LATCH_OPEN) {
+    // Solenoid is off, but the latch button isn't pressed: not physically closed yet
+    lockText = "NOT SECURED - close the latch";
+    color = "orange";
+  }
+  const text = `Connected to ${device.name} - ${lockText}`;
   if (result !== undefined && result !== RES_OK) {
     setStatus(`${text} - ${RESULT_TEXT[result] || `error ${result}`}`, "red");
   } else {
-    setStatus(text, "green");
+    setStatus(text, color);
   }
 }
 
-// Board notified State: [lock state][result of last command]
-function onState(dataView) {
+// State: [lock][result of last command][latch][tamper]. Firmware before 0.4.0 sent only 2 bytes.
+function readState(dataView) {
   unlocked = dataView.getUint8(0) !== 0;
-  const result = dataView.getUint8(1);
+  latch = dataView.byteLength > 2 ? dataView.getUint8(2) : LATCH_NOT_FITTED;
+  return dataView.getUint8(1);
+}
+
+// Board notified State
+function onState(dataView) {
+  const result = readState(dataView);
   if (stateWaiter) {
     stateWaiter(result);
     stateWaiter = null;
@@ -306,6 +322,7 @@ function onDisconnected() {
   nonceChar = commandChar = null;
   stateWaiter = null;
   unlocked = false;
+  latch = LATCH_NOT_FITTED;
   updateToggle();
   toggleBtn.disabled = true;
   connectBtn.textContent = "Reconnect";
@@ -348,7 +365,7 @@ async function connect(pickNew) {
     nonceChar = await service.getCharacteristic(NONCE_CHAR_UUID);
     commandChar = await service.getCharacteristic(COMMAND_CHAR_UUID);
 
-    unlocked = (await stateChar.readValue()).getUint8(0) !== 0;
+    readState(await stateChar.readValue());
     updateToggle();
     stateChar.addEventListener("characteristicvaluechanged", (e) => onState(e.target.value));
     await stateChar.startNotifications();

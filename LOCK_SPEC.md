@@ -79,7 +79,9 @@ State was 2 bytes before firmware 0.4.0. Read at least 2 bytes, and ignore any b
 you know about.
 
 "Locked" (byte 0) only means the solenoid is off. Only latch = `1` confirms that the vehicle is
-physically secured. Current hardware has no latch or tamper sensor, so both report `0xFF`.
+physically secured. Apps should show "locked" only when byte 0 = `0` and latch is `1` (or `0xFF`, no
+sensor), and "not secured" when latch is `0`. The prototype has a latch button on D1. It has no tamper
+sensor, so tamper reports `0xFF`.
 
 ### Battery Service `0x180F` (standard)
 

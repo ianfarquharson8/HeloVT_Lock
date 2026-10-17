@@ -1,4 +1,5 @@
-// HeloVT lock - XIAO nRF52840 firmware: BLE-controlled lock (solenoid on D0, onboard LED mirrors it)
+// HeloVT lock - XIAO nRF52840 firmware: BLE-controlled lock (solenoid on D0, latch button on D1,
+// onboard LED on while the lock is not secured: unlocked, or latch open)
 // Board package: "Seeed nRF52 mbed-enabled Boards" -> "Seeed XIAO BLE - nRF52840"
 // Library: ArduinoBLE
 // Before uploading, run `python make_key.py` in the project folder to create secret.h.
@@ -58,7 +59,7 @@
 // reads as open. Uncomment the ones that are fitted.
 //   LATCH_PIN:  switch closed = latch/shackle physically engaged
 //   TAMPER_PIN: switch closed = enclosure lid closed
-// #define LATCH_PIN D1
+#define LATCH_PIN D1  // prototype: tactile button, pressed when the lock is closed
 // #define TAMPER_PIN D2
 
 #include <ArduinoBLE.h>
@@ -227,12 +228,21 @@ bool solenoidCanUnlock() {
   return heat + UNLOCK_MS * COOL_RATIO <= HEAT_LIMIT_MS * COOL_RATIO;
 }
 
+// LED on (LOW) while the lock is not secured: solenoid powered, or the latch sensor reads open
+void updateLed() {
+  bool secured = !unlocked;
+#ifdef LATCH_PIN
+  secured = secured && latchClosed;
+#endif
+  digitalWrite(LED_PIN, secured ? HIGH : LOW);
+}
+
 void setLock(bool unlock) {
   updateHeat();  // count the time up to now at the old state
   unlocked = unlock;
   unlockedAt = millis();
-  digitalWrite(LED_PIN, unlock ? LOW : HIGH);
   digitalWrite(SOLENOID_PIN, unlock ? HIGH : LOW);
+  updateLed();
 }
 
 // Fill buf (a multiple of 8 bytes) with random bytes from the BLE controller, which reads the
@@ -329,6 +339,7 @@ void updateSensors() {
   if (closed == lastClosed && closed != latchClosed) {
     latchClosed = closed;
     logEvent(closed ? EVT_LATCH_CLOSED : EVT_LATCH_OPEN);
+    updateLed();
     changed = true;
   }
   lastClosed = closed;
@@ -452,6 +463,7 @@ void setup() {
   pinMode(LATCH_PIN, INPUT_PULLUP);
   delay(1);
   latchClosed = digitalRead(LATCH_PIN) == LOW;
+  updateLed();
 #endif
 #ifdef TAMPER_PIN
   pinMode(TAMPER_PIN, INPUT_PULLUP);

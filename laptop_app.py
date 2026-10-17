@@ -26,6 +26,7 @@ CMD_LOCK, CMD_UNLOCK = 0, 1
 RESULT_TEXT = {0: "no command yet", 1: "OK", 2: "rejected: wrong key",
                4: "rejected: bad command", 5: "solenoid cooling down, try again shortly"}
 RES_OK = 1
+LATCH_OPEN, LATCH_NOT_FITTED = 0, 0xFF
 
 KEY_FILE = Path(__file__).with_name("lock_key.txt")
 
@@ -48,7 +49,7 @@ class BleWorker:
     def __init__(self, key, name, on_state):
         self.key = key
         self.name = name
-        self.on_state = on_state  # called with (unlocked, result) on every State notification
+        self.on_state = on_state  # called with (unlocked, result, latch) on every State notification
         self.loop = asyncio.new_event_loop()
         self.client = None
         self.state_event = None
@@ -61,7 +62,9 @@ class BleWorker:
             future.add_done_callback(callback)
 
     def _handle_state(self, _char, data):
-        self.last_state = (bool(data[0]), data[1])
+        # State: [lock][result][latch][tamper]; firmware before 0.4.0 sent only the first 2 bytes
+        latch = data[2] if len(data) > 2 else LATCH_NOT_FITTED
+        self.last_state = (bool(data[0]), data[1], latch)
         self.state_event.set()
         self.on_state(*self.last_state)
 
@@ -75,7 +78,7 @@ class BleWorker:
         await self.client.start_notify(STATE_CHAR_UUID, self._handle_state)
 
     async def send(self, cmd):
-        """Sign and send a command. Returns (unlocked, result) as reported by the board."""
+        """Sign and send a command. Returns (unlocked, result, latch) as reported by the board."""
         if not self.client or not self.client.is_connected:
             await self.connect()
         nonce = await self.client.read_gatt_char(NONCE_CHAR_UUID)
@@ -108,19 +111,26 @@ class App:
 
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
-    def show(self, unlocked, result=None):
+    def show(self, unlocked, result=None, latch=LATCH_NOT_FITTED):
         self.unlocked = unlocked
         self.button.config(text="Lock now" if unlocked else "Unlock")
-        text = "UNLOCKED (relocks automatically)" if unlocked else "Locked"
         color = "green"
+        if unlocked:
+            text = "UNLOCKED (relocks automatically)"
+        elif latch == LATCH_OPEN:
+            # Solenoid is off, but the latch button isn't pressed: not physically closed yet
+            text = "NOT SECURED - close the latch"
+            color = "orange"
+        else:
+            text = "Locked"
         if result is not None and result != RES_OK:
             text += f" - {RESULT_TEXT.get(result, f'error {result}')}"
             color = "red"
         self.status.config(text=f"Connected - {text}", fg=color)
 
-    def on_state(self, unlocked, result):
-        # Board-initiated changes, e.g. the auto-relock. Runs on the BLE thread.
-        self.root.after(0, lambda: self.show(unlocked))
+    def on_state(self, unlocked, result, latch):
+        # Board-initiated changes, e.g. the auto-relock or the latch button. Runs on the BLE thread.
+        self.root.after(0, lambda: self.show(unlocked, latch=latch))
 
     def press(self):
         cmd = CMD_LOCK if self.unlocked else CMD_UNLOCK

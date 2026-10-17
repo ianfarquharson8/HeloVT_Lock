@@ -14,7 +14,7 @@ Firmware 0.4.0. The app-facing protocol is in [LOCK_SPEC.md](LOCK_SPEC.md).
 | 6 | Firmware version | **Done.** Device Information Service, Firmware Revision String. |
 | 7 | Name reaches phones | **Byte budget checked, not yet tested on phones.** See LOCK_SPEC.md, "Advertising". |
 | 8 | HMAC test vectors | **Done**, and checked against the firmware's own code. See LOCK_SPEC.md. |
-| 9 | Latch sensor | **Firmware ready, needs hardware.** Set `LATCH_PIN` once a switch is fitted. |
+| 9 | Latch sensor | **On in the prototype:** a tactile button on D1 (`LATCH_PIN`). Production needs a sealed switch (see [Hardware](#hardware-requirements-open-to-be-confirmed)). |
 | 10 | Tamper sensor | **Firmware ready, needs hardware.** Set `TAMPER_PIN`. |
 | 11 | Advertising interval, battery life | **Interval set to 152.5 ms. CPU now sleeps between events. Battery life not measured.** See [Power](#power-and-battery-life). |
 | 12 | Solenoid duty cycle | **Done:** a heat budget, with limits to be set from the solenoid's datasheet. See [Solenoid duty cycle](#solenoid-duty-cycle). |
