@@ -84,7 +84,7 @@
 
 <script>
 // These must match the UUIDs in xiao_led_ble.ino
-const DEVICE_NAME = "HeloVT-Lock";
+const NAME_PREFIX = "Helo-";  // each lock advertises its own name, e.g. Helo-7F3A
 const SERVICE_UUID = "19b10100-e8f2-537e-4f6c-d104768a1214";
 const STATE_CHAR_UUID = "19b10101-e8f2-537e-4f6c-d104768a1214";
 const UPTIME_CHAR_UUID = "19b10102-e8f2-537e-4f6c-d104768a1214";
@@ -328,7 +328,7 @@ async function connect(pickNew) {
     if (pickNew || !device) {
       setStatus("Choose the device in the popup...", "orange");
       const picked = await navigator.bluetooth.requestDevice({
-        filters: [{ name: DEVICE_NAME }],
+        filters: [{ namePrefix: NAME_PREFIX }],
         optionalServices: [SERVICE_UUID],
       });
       if (device) device.removeEventListener("gattserverdisconnected", onDisconnected);

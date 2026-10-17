@@ -12,6 +12,10 @@
 // The nonce changes after every attempt and on every connect, so a recorded command can't be
 // replayed. After MAX_FAILS bad signatures in a row, the board drops the connection and ignores
 // commands for LOCKOUT_MS. An unlock relocks by itself after UNLOCK_MS.
+// The board takes one connection at a time, so it drops any connection that goes IDLE_MS without
+// a valid command. Someone without the key can't hold the lock and block the real user.
+//
+// Each lock advertises its own name from secret.h (e.g. "Helo-7F3A"), so apps can tell locks apart.
 //
 // Characteristics (service SERVICE_UUID):
 //   State   (read/notify): [lock state: 0 = locked, 1 = unlocked][result of last command: CmdResult]
@@ -32,13 +36,15 @@
 #include "hmac_sha256.h"
 
 #if __has_include("secret.h")
-#include "secret.h"  // defines LOCK_KEY
+#include "secret.h"  // defines LOCK_KEY and LOCK_NAME
 #else
 #error "secret.h is missing. Run `python make_key.py` in the project folder to create it."
 #endif
+#ifndef LOCK_NAME
+#error "secret.h has no LOCK_NAME. Run `python make_key.py` again to add one (it keeps the key)."
+#endif
 
 // These must match laptop_app.py and web/index.html
-#define DEVICE_NAME "HeloVT-Lock"
 #define SERVICE_UUID "19b10100-e8f2-537e-4f6c-d104768a1214"
 #define STATE_CHAR_UUID "19b10101-e8f2-537e-4f6c-d104768a1214"
 #define UPTIME_CHAR_UUID "19b10102-e8f2-537e-4f6c-d104768a1214"
@@ -53,6 +59,7 @@ const int COMMAND_LEN = 1 + MAC_LEN;
 const unsigned long UNLOCK_MS = 5000;    // how long an unlock lasts before relocking
 const int MAX_FAILS = 3;                 // bad signatures in a row before a lockout
 const unsigned long LOCKOUT_MS = 30000;
+const unsigned long IDLE_MS = 20000;     // drop a connection after this long without a valid command
 
 enum Command : uint8_t { CMD_LOCK = 0, CMD_UNLOCK = 1 };
 enum CmdResult : uint8_t { RES_NONE = 0, RES_OK = 1, RES_BAD_AUTH = 2, RES_LOCKED_OUT = 3, RES_BAD_FORMAT = 4 };
@@ -238,7 +245,8 @@ void setup() {
     while (1);
   }
 
-  BLE.setLocalName(DEVICE_NAME);
+  BLE.setLocalName(LOCK_NAME);
+  BLE.setDeviceName(LOCK_NAME);  // the GATT name, which iOS shows (and caches) after connecting
   BLE.setAdvertisedService(lockService);
   lockService.addCharacteristic(stateChar);
   lockService.addCharacteristic(uptimeChar);
@@ -253,7 +261,7 @@ void setup() {
   logEvent(EVT_BOOT);
 
   BLE.advertise();
-  Serial.println("Advertising as " DEVICE_NAME "...");
+  Serial.println("Advertising as " LOCK_NAME "...");
 }
 
 void loop() {
@@ -267,9 +275,19 @@ void loop() {
     newNonce();  // a nonce read during an earlier connection can't be reused
 
     unsigned long lastUptimeSent = 0;
+    unsigned long lastActivity = millis();
     while (central.connected()) {
       updateTimers();
-      if (commandChar.written()) handleCommand(central);
+      if (commandChar.written()) {
+        handleCommand(central);
+        if (lastResult == RES_OK) lastActivity = millis();
+      }
+
+      if (millis() - lastActivity >= IDLE_MS) {
+        Serial.println("Idle, disconnecting");
+        central.disconnect();
+        break;
+      }
 
       // Push the board's internal time to the app once a second
       if (millis() - lastUptimeSent >= 1000) {

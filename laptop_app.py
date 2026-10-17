@@ -1,6 +1,7 @@
 """Laptop app: unlock the HeloVT lock (XIAO nRF52840) over BLE.
 
 Every command is signed with the secret key in lock_key.txt (see xiao_led_ble.ino for the protocol).
+It connects to the lock named in lock_key.txt.
 
 Install:  pip install bleak
 Setup:    python make_key.py   (once; then upload the firmware)
@@ -17,7 +18,6 @@ from pathlib import Path
 from bleak import BleakClient, BleakScanner
 
 # These must match the UUIDs in xiao_led_ble.ino
-DEVICE_NAME = "HeloVT-Lock"
 STATE_CHAR_UUID = "19b10101-e8f2-537e-4f6c-d104768a1214"
 NONCE_CHAR_UUID = "19b10104-e8f2-537e-4f6c-d104768a1214"
 COMMAND_CHAR_UUID = "19b10105-e8f2-537e-4f6c-d104768a1214"
@@ -31,17 +31,23 @@ KEY_FILE = Path(__file__).with_name("lock_key.txt")
 
 
 def load_key():
+    """Returns (key, lock name) from lock_key.txt."""
     try:
-        return bytes.fromhex(KEY_FILE.read_text().strip())
+        lines = KEY_FILE.read_text().split()
     except FileNotFoundError:
         raise SystemExit(f"{KEY_FILE.name} not found. Run `python make_key.py` first.")
+    if len(lines) < 2:
+        raise SystemExit(f"{KEY_FILE.name} has no lock name. Run `python make_key.py` again "
+                         "(it keeps the key), then re-upload the firmware.")
+    return bytes.fromhex(lines[0]), lines[1]
 
 
 class BleWorker:
     """Runs an asyncio loop in a background thread so the GUI stays responsive."""
 
-    def __init__(self, key, on_state):
+    def __init__(self, key, name, on_state):
         self.key = key
+        self.name = name
         self.on_state = on_state  # called with (unlocked, result) on every State notification
         self.loop = asyncio.new_event_loop()
         self.client = None
@@ -60,9 +66,9 @@ class BleWorker:
         self.on_state(*self.last_state)
 
     async def connect(self):
-        device = await BleakScanner.find_device_by_name(DEVICE_NAME, timeout=10)
+        device = await BleakScanner.find_device_by_name(self.name, timeout=10)
         if device is None:
-            raise RuntimeError(f"Could not find '{DEVICE_NAME}'")
+            raise RuntimeError(f"Could not find '{self.name}'")
         self.client = BleakClient(device)
         await self.client.connect()
         self.state_event = asyncio.Event()
@@ -87,10 +93,11 @@ class BleWorker:
 class App:
     def __init__(self, root):
         self.root = root
-        self.ble = BleWorker(load_key(), self.on_state)
+        key, name = load_key()
+        self.ble = BleWorker(key, name, self.on_state)
         self.unlocked = False
 
-        root.title("HeloVT Lock")
+        root.title(f"HeloVT Lock - {name}")
         root.geometry("320x180")
 
         self.status = tk.Label(root, text="Disconnected", fg="gray", wraplength=300)
