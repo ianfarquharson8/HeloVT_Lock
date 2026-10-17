@@ -76,9 +76,10 @@
     <thead><tr><th>Event</th><th>Board time</th><th>Clock time</th><th>Notes</th></tr></thead>
     <tbody id="log"><tr><td colspan="4" class="hint">Connect to load the log.</td></tr></tbody>
   </table>
-  <p class="hint">Newest first. The website keeps its own history (saved in this browser), so it
-    survives page refreshes and board resets. Disconnects show up instantly; rows marked "recorded by
-    website" are replaced by the board's own record when you reconnect.</p>
+  <p class="hint">Newest first, since the board's last boot (older entries are removed when it
+    reboots). The website saves this in the browser, so it survives page refreshes. Disconnects show up
+    instantly; rows marked "recorded by website" are replaced by the board's own record when you
+    reconnect.</p>
   <button id="clearLog" class="link">Clear website log</button>
 </div>
 
@@ -130,8 +131,8 @@ let boardUptimeMs = null;
 let boardUptimeAt = 0;
 
 // The website's own history, saved in localStorage. Every event has a wall-clock time.
-//   sessions: one per board power-on (identified by the wall-clock time it booted),
-//             holding the events read from the board's log
+//   sessions: the board's current power-on (identified by the wall-clock time it booted),
+//             holding the events read from the board's log. Only the latest boot is kept.
 //   pending:  disconnects the website saw itself that the board hasn't confirmed yet
 const STORAGE_KEY = "xiaoLockLog";
 // Boot times within this much of each other are treated as the same board session
@@ -141,7 +142,10 @@ let history = { sessions: [], pending: [] };
 function loadHistory() {
   try {
     const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
-    if (saved && Array.isArray(saved.sessions)) history = saved;
+    if (saved && Array.isArray(saved.sessions)) {
+      history = saved;
+      history.sessions = history.sessions.slice(-1);  // history saved by older versions kept every boot
+    }
   } catch {}
 }
 
@@ -275,12 +279,8 @@ function mergeBoardLog(dataView, uptime) {
     const oldestOnBoard = events.length ? events[0].ms : Infinity;
     last.events = [...last.events.filter((e) => e.ms < oldestOnBoard), ...events];
   } else {
-    // Board was reset since we last saw it: its old log is gone, so keep the
-    // website's disconnect records as the only copy.
-    if (last) {
-      last.events.push(...history.pending.map((e) => ({ ...e, pending: false, websiteOnly: true })));
-    }
-    history.sessions.push({ bootWall, events });
+    // Board rebooted since we last saw it: drop everything from before this boot
+    history.sessions = [{ bootWall, events }];
   }
   history.pending = [];
   saveHistory();
@@ -299,8 +299,7 @@ function renderLog() {
     else if (e.type === 1 && prev && prev.type === 0) notes.push("First connection since boot");
     else if (e.type === 2 && prev && prev.type === 1) notes.push(`Was connected for ${formatDuration(e.wall - prev.wall)}`);
     if (e.pending) notes.push("recorded by website, board's record syncs on reconnect");
-    if (e.websiteOnly) notes.push("recorded by website only (board was reset before it synced)");
-    const estimated = e.pending || e.websiteOnly;
+    const estimated = e.pending;
     return `<tr class="${estimated ? "pending" : ""}">` +
            `<td class="${EVENT_CLASSES[e.type] || ""}">${EVENT_NAMES[e.type] || `Unknown (${e.type})`}</td>` +
            `<td class="time">${formatTime(e.ms)}${estimated ? " (est.)" : ""}</td>` +
