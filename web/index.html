@@ -96,11 +96,14 @@ const CMD_LOCK = 0, CMD_UNLOCK = 1;
 const RES_OK = 1;
 const RESULT_TEXT = {
   0: "no command yet", 1: "OK", 2: "rejected: wrong key",
-  3: "rejected: too many bad attempts, wait 30s", 4: "rejected: bad command",
+  4: "rejected: bad command", 5: "solenoid cooling down, try again shortly",
 };
 
-const EVENT_NAMES = { 0: "Boot", 1: "Connected", 2: "Disconnected", 3: "Unlocked", 4: "Locked", 5: "Bad key attempt" };
-const EVENT_CLASSES = { 0: "evt-boot", 1: "evt-connect", 2: "evt-disconnect", 3: "evt-unlock", 5: "evt-fail" };
+const EVENT_NAMES = {
+  0: "Boot", 1: "Connected", 2: "Disconnected", 3: "Unlocked", 4: "Locked", 5: "Bad key attempt",
+  6: "Enclosure opened", 7: "Latch opened", 8: "Latch closed",
+};
+const EVENT_CLASSES = { 0: "evt-boot", 1: "evt-connect", 2: "evt-disconnect", 3: "evt-unlock", 5: "evt-fail", 6: "evt-fail" };
 const KEY_STORAGE_KEY = "heloVTLockKey";
 
 const statusEl = document.getElementById("status");

@@ -24,7 +24,7 @@ COMMAND_CHAR_UUID = "19b10105-e8f2-537e-4f6c-d104768a1214"
 
 CMD_LOCK, CMD_UNLOCK = 0, 1
 RESULT_TEXT = {0: "no command yet", 1: "OK", 2: "rejected: wrong key",
-               3: "rejected: too many bad attempts, wait 30s", 4: "rejected: bad command"}
+               4: "rejected: bad command", 5: "solenoid cooling down, try again shortly"}
 RES_OK = 1
 
 KEY_FILE = Path(__file__).with_name("lock_key.txt")

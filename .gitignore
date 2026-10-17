@@ -4,3 +4,6 @@ __pycache__/
 # Secret lock key (created by make_key.py)
 lock_key.txt
 xiao_led_ble/secret.h
+
+# Firmware build output (PRODUCTION.md)
+build/
