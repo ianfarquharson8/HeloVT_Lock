@@ -1,5 +1,4 @@
-// HeloVT lock - XIAO nRF52840 firmware: BLE-controlled lock (solenoid on D0, latch button on D1,
-// onboard LED on while the lock is not secured: unlocked, or latch open)
+// HeloVT lock - XIAO nRF52840 firmware: BLE-controlled lock (solenoid on D0, latch button on D1)
 // Board package: "Seeed nRF52 mbed-enabled Boards" -> "Seeed XIAO BLE - nRF52840"
 // Library: ArduinoBLE
 // Before uploading, run `python make_key.py` in the project folder to create secret.h.
@@ -137,7 +136,7 @@ BLEService deviceInfoService("180A");
 BLEStringCharacteristic modelChar("2A24", BLERead, 20);
 BLEStringCharacteristic firmwareRevChar("2A26", BLERead, 20);
 
-// The XIAO's onboard LEDs are active LOW (LOW = on)
+// The XIAO's onboard LEDs are active LOW (LOW = on). Kept off.
 const int LED_PIN = LED_BUILTIN;
 
 // Solenoid control output (active HIGH: HIGH = 3.3V). D0 can only source a few mA, so it must
@@ -228,21 +227,11 @@ bool solenoidCanUnlock() {
   return heat + UNLOCK_MS * COOL_RATIO <= HEAT_LIMIT_MS * COOL_RATIO;
 }
 
-// LED on (LOW) while the lock is not secured: solenoid powered, or the latch sensor reads open
-void updateLed() {
-  bool secured = !unlocked;
-#ifdef LATCH_PIN
-  secured = secured && latchClosed;
-#endif
-  digitalWrite(LED_PIN, secured ? HIGH : LOW);
-}
-
 void setLock(bool unlock) {
   updateHeat();  // count the time up to now at the old state
   unlocked = unlock;
   unlockedAt = millis();
   digitalWrite(SOLENOID_PIN, unlock ? HIGH : LOW);
-  updateLed();
 }
 
 // Fill buf (a multiple of 8 bytes) with random bytes from the BLE controller, which reads the
@@ -339,7 +328,6 @@ void updateSensors() {
   if (closed == lastClosed && closed != latchClosed) {
     latchClosed = closed;
     logEvent(closed ? EVT_LATCH_CLOSED : EVT_LATCH_OPEN);
-    updateLed();
     changed = true;
   }
   lastClosed = closed;
@@ -443,8 +431,9 @@ String firmwareRevision() {
 void setup() {
   // Fail-secure: make sure the solenoid is off before anything else
   pinMode(SOLENOID_PIN, OUTPUT);
-  pinMode(LED_PIN, OUTPUT);
   setLock(false);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, HIGH);
 
 #ifdef PRODUCTION
   enableReadbackProtection();
@@ -463,7 +452,6 @@ void setup() {
   pinMode(LATCH_PIN, INPUT_PULLUP);
   delay(1);
   latchClosed = digitalRead(LATCH_PIN) == LOW;
-  updateLed();
 #endif
 #ifdef TAMPER_PIN
   pinMode(TAMPER_PIN, INPUT_PULLUP);
