@@ -1,6 +1,6 @@
 # HeloVT lock: production build, flashing and hardware
 
-Firmware 0.4.0. The app-facing protocol is in [LOCK_SPEC.md](LOCK_SPEC.md).
+Firmware 0.5.0. The app-facing protocol is in [LOCK_SPEC.md](LOCK_SPEC.md).
 
 ## Review status
 
@@ -16,7 +16,7 @@ Firmware 0.4.0. The app-facing protocol is in [LOCK_SPEC.md](LOCK_SPEC.md).
 | 8 | HMAC test vectors | **Done**, and checked against the firmware's own code. See LOCK_SPEC.md. |
 | 9 | Latch sensor | **On in the prototype:** a tactile button on D1 (`LATCH_PIN`). Production needs a sealed switch (see [Hardware](#hardware-requirements-open-to-be-confirmed)). |
 | 10 | Tamper sensor | **Firmware ready, needs hardware.** Set `TAMPER_PIN`. |
-| 11 | Advertising interval, battery life | **Interval set to 152.5 ms. CPU now sleeps between events. Battery life not measured.** See [Power](#power-and-battery-life). |
+| 11 | Advertising interval, battery life | **Software power work done in 0.5.0 and compiled, not yet tested on a board. Battery life not measured.** See [Power](#power-and-battery-life). |
 | 12 | Solenoid duty cycle | **Done:** a heat budget, with limits to be set from the solenoid's datasheet. See [Solenoid duty cycle](#solenoid-duty-cycle). |
 | 13 to 15 | Later items | Notes only. See [Later](#later-not-for-the-beta). |
 | - | Hardware | **Open.** Requirements are below. None of it is built or decided yet. |
@@ -99,7 +99,7 @@ Check each board:
 1. `nrfjprog --readcode check.hex` fails with a readback-protection error.
 2. With USB plugged in, double-tap reset. No USB drive appears.
 3. In nRF Connect: the board advertises as `Helo-XXXX`, and Device Information shows firmware
-   `0.4.0` (not `-dev` or `-bootloader`).
+   `0.5.0` (not `-dev` or `-bootloader`).
 4. A server-signed unlock works, and D0 measures about 3.3 V while unlocked.
 
 If the board doesn't advertise after step 4, it means the SoftDevice-to-firmware handover assumed
@@ -112,8 +112,10 @@ flash the Seeed bootloader hex from the Arduino core's `bootloaders/` folder.
 
 - **APPROTECT**: on first boot the firmware writes `UICR.APPROTECT = Enabled` and reboots. After
   that, a debugger can't read flash. Only a full erase undoes it.
-- **No Serial output.** The board still shows up as a USB serial port, because the Arduino core
-  always starts USB, but it prints nothing.
+- **USB off.** The Arduino core always starts USB before `setup()`, and the firmware shuts it down
+  again (`PluggableUSBD().deinit()`). The board doesn't show up as a USB device and prints nothing.
+  This saves power when the board is fed through its 5 V pin. **Not yet tested on a board.** If a
+  production build doesn't advertise, try removing that line first.
 - **Watchdog** (8 s): if the main loop stops, the chip reboots and comes back up locked. It is off in
   dev builds because the USB bootloader doesn't feed it and an upload would get interrupted.
   `#define USE_WATCHDOG` turns it on for testing (double-tap reset before each upload).
@@ -141,13 +143,36 @@ Limits:
 
 ## Power and battery life
 
-- **Advertising interval**: 152.5 ms (one of Apple's recommended values). A phone standing next to
-  the lock should find it in well under a second. Advertising at this rate costs tens of µA.
-- **Sleep**: the main loop used to spin continuously. It now waits for BLE events (up to 50 ms at a
-  time), so the CPU can sleep between them.
-- **Expected battery life: not measured.** The Arduino mbed core isn't built for very low power, so
-  expect an average draw somewhere around 1 mA. That's about 40 days on a 1000 mAh cell before any
-  solenoid use. Measure a real board with a Nordic Power Profiler Kit II before quoting a number.
+What the firmware does to save power (0.5.0, compiled but **not yet measured or tested on a board**):
+
+| Change | Why | Constant / function |
+|---|---|---|
+| Sensor pull-ups on only during a read | The internal ~13 kΩ pull-up draws about 250 µA through a closed switch, and the latch is closed whenever the vehicle is parked locked. | `switchClosed()` |
+| Slow loop while idle | Wakes every 500 ms while locked and not connected, and every 50 ms while unlocked or connected. A connecting phone wakes it at once. Latch and tamper changes made while nobody is connected can be logged up to about 1 s late. | `IDLE_POLL_MS`, `POLL_MS` |
+| Advertising interval 546.25 ms (was 152.5 ms) | About 3.5 times less advertising energy. Phones still find the lock in about 1 to 1.5 s. 152.5, 417.5, 760 and 1022.5 ms are other Apple-recommended values. | `ADVERTISING_INTERVAL` |
+| Unlock ends when the latch opens | The solenoid used to stay on for the full 5 s. Now it turns off as soon as the latch sensor reads open, which cuts most of each unlock's energy and heat. Turn it off if the mechanism needs the solenoid held while the latch is closed again. | `RELEASE_ON_LATCH_OPEN` |
+| DC/DC regulator on | About 30 to 40 % less current while the CPU or radio runs. The XIAO has the inductor (Zephyr's board file for it uses DC/DC mode). | `NRF_POWER->DCDCEN` in `setup()` |
+| Onboard flash in deep power-down | The unused 2 MB QSPI flash otherwise sits in standby. | `flashDeepPowerDown()` |
+| USB off (production) | See [What `PRODUCTION` changes](#what-production-changes). | `setup()` |
+
+Not changed:
+
+- **Uptime notifications** (once a second while connected) stay, because the apps use them.
+  Connections last 20 s at most.
+- **Battery divider**: about 3 µA through the 1.5 MΩ divider all the time, because P0.14 must stay
+  LOW to protect P0.31.
+
+Next steps:
+
+- **Measure** a board with a Nordic Power Profiler Kit II on the BAT pads (not USB), dev and
+  production builds, idle and during an unlock. Record the numbers here.
+- **The Arduino mbed core sets the floor.** Even after these changes, expect the idle draw to be
+  set by the core rather than the firmware: likely hundreds of µA, not the 10 to 30 µA an nRF52840
+  can reach. Moving to nRF Connect SDK (item 13) is the main remaining battery-life fix.
+- **Pull-in then hold**: once the solenoid is chosen, run it at full power for about 100 to 200 ms,
+  then PWM it at the lower holding current from its datasheet. It matters less now that
+  `RELEASE_ON_LATCH_OPEN` ends most unlocks early, but it still helps when nobody opens the latch.
+  Note that PWM hardware keeps running if the firmware hangs, until the watchdog reboots the board.
 - **The solenoid dominates.** A typical 12 V lock solenoid draws 0.5 to 1 A, so one 5 s unlock uses
   about 0.7 to 1.4 mAh at 12 V. A single LiPo cell can't drive it without a boost converter.
 - **Recommendation**: power the lock from the scooter's main pack. Tap the pack before the scooter's

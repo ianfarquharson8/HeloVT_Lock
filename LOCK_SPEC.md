@@ -1,6 +1,6 @@
 # HeloVT lock: BLE spec for the Helo app and server
 
-Firmware 0.4.0. This is the contract between the lock firmware ([xiao_led_ble.ino](xiao_led_ble/xiao_led_ble.ino)),
+Firmware 0.5.0. This is the contract between the lock firmware ([xiao_led_ble.ino](xiao_led_ble/xiao_led_ble.ino)),
 the Helo app and the `lock-sign` server function. Production build, flashing and hardware notes are in
 [PRODUCTION.md](PRODUCTION.md).
 
@@ -26,7 +26,7 @@ The phone never has the key. It only relays between the lock and the server.
 | Idle disconnect | 20 s | The lock drops the connection 20 s after connecting, or 20 s after the last command that returned OK. Steps 3 to 5 must finish inside that window. |
 | Nonce lifetime | one attempt | A nonce is replaced after every command (good or bad) and on every connect and disconnect. Read a fresh one for each command. A signature is therefore useless after at most 20 s. |
 | Bad signature | disconnect | After result 2 the lock drops the connection about 100 ms after notifying. The notification may not arrive, so treat "wrote a command, then got disconnected" as a possible bad signature. There is no lockout. |
-| Unlock duration | 5 s | The solenoid stays powered for 5 s, then the lock relocks itself and notifies State (lock = 0). |
+| Unlock duration | up to 5 s | The solenoid stays powered until the latch opens (latch sensor goes from `1` to `0`) or 5 s pass, whichever is first. Then the lock relocks itself and notifies State (lock = 0). Since 0.5.0 an unlock usually ends within a fraction of a second of the rider opening the latch, so don't treat lock = 0 right after an unlock as a failure. |
 | Solenoid cooldown | result 5 | Too many unlocks in a row. Wait and retry with a new nonce. With the current settings it is never more than 15 s before the next unlock is allowed. A lock command (`0x00`) is never refused for this. |
 | One connection | - | The lock accepts one connection at a time and stops advertising while connected. If it can't be found, someone else may be connected. Retry for up to about 20 s. |
 
@@ -47,7 +47,8 @@ it is in the scan response. Phones get the scan response when they scan actively
 - **Android**: the default scan is active. Read `ScanResult.getScanRecord().getDeviceName()`.
 - **Web Bluetooth** (Chrome/Edge): filter with `{ namePrefix: "Helo-" }`.
 
-Advertising interval: 152.5 ms.
+Advertising interval: 546.25 ms (152.5 ms before 0.5.0, changed to save battery). A phone in the
+foreground usually finds the lock within about 1 to 1.5 s.
 
 **Not yet tested on phones.** The byte budget above is computed from ArduinoBLE 2.1.0, which puts
 the name in the scan response. To check: in nRF Connect on an iPhone and on an Android phone, scan
@@ -97,13 +98,13 @@ PRODUCTION.md, "Battery" for what it measures and its limits.
 | Characteristic | UUID | Properties | Value |
 |---|---|---|---|
 | Model Number String | `0x2A24` | read | `HeloVT Lock` |
-| Firmware Revision String | `0x2A26` | read | e.g. `0.4.0` |
+| Firmware Revision String | `0x2A26` | read | e.g. `0.5.0` |
 
 Firmware revision values:
 
-- `0.4.0`: production build, flashed correctly.
-- `0.4.0-dev`: development build. Should never be on a rider's vehicle.
-- `0.4.0-bootloader`: production build on a board that still has the USB bootloader. Anyone with
+- `0.5.0`: production build, flashed correctly.
+- `0.5.0-dev`: development build. Should never be on a rider's vehicle.
+- `0.5.0-bootloader`: production build on a board that still has the USB bootloader. Anyone with
   a USB cable can read its key or flash other firmware. **The server should flag this lock and not
   rent it out.**
 

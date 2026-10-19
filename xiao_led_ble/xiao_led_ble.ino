@@ -37,6 +37,11 @@
 //
 // The BLE link itself is not encrypted, so anyone nearby can read the state, log, battery level
 // and firmware version. They can't unlock without the key.
+//
+// POWER (see PRODUCTION.md, "Power and battery life"): the CPU sleeps in BLE.poll() between events,
+// waking every POLL_MS while unlocked or connected and every IDLE_POLL_MS otherwise. The sensor
+// pull-ups are on only during each read, the DC/DC regulator is on, the unused onboard flash is put
+// into deep power-down, and production builds shut USB off. An unlock ends as soon as the latch opens.
 
 // ---- Build options ----
 // PRODUCTION: readback protection, no Serial output, watchdog. Build it with
@@ -52,17 +57,25 @@
 #define USE_WATCHDOG
 #endif
 
-#define FIRMWARE_VERSION "0.4.0"
+#define FIRMWARE_VERSION "0.5.0"
 
-// Optional sensors: a switch from the pin to GND (the pin's internal pull-up is used), so a cut wire
-// reads as open. Uncomment the ones that are fitted.
+// Optional sensors: a switch from the pin to GND (the pin's internal pull-up is switched on for each
+// read), so a cut wire reads as open. Uncomment the ones that are fitted.
 //   LATCH_PIN:  switch closed = latch/shackle physically engaged
 //   TAMPER_PIN: switch closed = enclosure lid closed
 #define LATCH_PIN D1  // prototype: tactile button, pressed when the lock is closed
 // #define TAMPER_PIN D2
 
+// Cut solenoid power as soon as the latch opens, instead of holding it for the full UNLOCK_MS.
+// Saves most of the energy of each unlock. Turn off if the mechanism needs the solenoid held while
+// the latch is being closed again.
+#define RELEASE_ON_LATCH_OPEN
+
 #include <ArduinoBLE.h>
 #include <utility/HCI.h>
+#ifdef PRODUCTION
+#include <USB/PluggableUSBDevice.h>
+#endif
 #include "hmac_sha256.h"
 
 #if __has_include("secret.h")
@@ -97,8 +110,11 @@ const int COMMAND_LEN = 1 + MAC_LEN;
 const unsigned long UNLOCK_MS = 5000;    // how long an unlock lasts before relocking
 const unsigned long IDLE_MS = 20000;     // drop a connection after this long without a valid command
 const unsigned long WATCHDOG_MS = 8000;  // reboot if the loop stops running for this long
-const unsigned long POLL_MS = 50;        // longest the loop sleeps waiting for BLE events
-const uint16_t ADVERTISING_INTERVAL = 244;  // x 0.625 ms = 152.5 ms, one of Apple's recommended values
+const unsigned long POLL_MS = 50;        // longest the loop sleeps waiting for BLE events, while
+                                         // unlocked or connected
+const unsigned long IDLE_POLL_MS = 500;  // the same while locked and not connected (sensor reads
+                                         // and their timestamps can lag by up to 2 x this)
+const uint16_t ADVERTISING_INTERVAL = 874;  // x 0.625 ms = 546.25 ms, one of Apple's recommended values
 
 // Solenoid heat budget. On-time builds heat, which drains COOL_RATIO times slower while it's off
 // (so about 1 / (1 + COOL_RATIO) = 25% duty cycle sustained). An unlock is refused if a full
@@ -315,7 +331,28 @@ void updateTimers() {
   }
 }
 
-// Read the switches every 50 ms. A change counts once two reads in a row agree (debounce).
+// True if the switch from pin to GND is closed. The internal pull-up (about 13 kOhm) is on only for
+// the read: left on, a closed switch would draw about 250 uA for as long as the lock is closed.
+// Between reads the pin is a disconnected input, which draws nothing.
+const unsigned int SWITCH_SETTLE_US = 50;  // time for the pull-up to charge the wire
+
+bool switchClosed(int pin) {
+  uint32_t n = digitalPinToPinName(pin);  // nRF GPIO number: 0-31 port 0, 32-47 port 1
+  NRF_GPIO_Type* port = n < 32 ? NRF_P0 : NRF_P1;
+  uint32_t bit = n & 31;
+  port->PIN_CNF[bit] = (GPIO_PIN_CNF_DIR_Input << GPIO_PIN_CNF_DIR_Pos) |
+                       (GPIO_PIN_CNF_INPUT_Connect << GPIO_PIN_CNF_INPUT_Pos) |
+                       (GPIO_PIN_CNF_PULL_Pullup << GPIO_PIN_CNF_PULL_Pos);
+  delayMicroseconds(SWITCH_SETTLE_US);
+  bool closed = ((port->IN >> bit) & 1) == 0;
+  port->PIN_CNF[bit] = (GPIO_PIN_CNF_DIR_Input << GPIO_PIN_CNF_DIR_Pos) |
+                       (GPIO_PIN_CNF_INPUT_Disconnect << GPIO_PIN_CNF_INPUT_Pos) |
+                       (GPIO_PIN_CNF_PULL_Disabled << GPIO_PIN_CNF_PULL_Pos);
+  return closed;
+}
+
+// Read the switches at most every 50 ms (each loop pass; see POLL_MS and IDLE_POLL_MS). A change
+// counts once two reads in a row agree (debounce).
 void updateSensors() {
   static unsigned long lastRead = 0;
   if (millis() - lastRead < 50) return;
@@ -324,18 +361,25 @@ void updateSensors() {
 
 #ifdef LATCH_PIN
   static bool lastClosed = latchClosed;
-  bool closed = digitalRead(LATCH_PIN) == LOW;
+  bool closed = switchClosed(LATCH_PIN);
   if (closed == lastClosed && closed != latchClosed) {
     latchClosed = closed;
     logEvent(closed ? EVT_LATCH_CLOSED : EVT_LATCH_OPEN);
     changed = true;
+#ifdef RELEASE_ON_LATCH_OPEN
+    // The latch is open, so the solenoid's job is done
+    if (!closed && unlocked) {
+      setLock(false);
+      logEvent(EVT_LOCK);
+    }
+#endif
   }
   lastClosed = closed;
 #endif
 
 #ifdef TAMPER_PIN
   static bool lastOpen = false;
-  bool open = digitalRead(TAMPER_PIN) == HIGH;
+  bool open = !switchClosed(TAMPER_PIN);
   if (open && lastOpen && !tampered) {
     tampered = true;  // stays set until reboot, so opening it while nobody is connected still shows
     logEvent(EVT_TAMPER);
@@ -379,6 +423,31 @@ void updateBattery() {
   lastRead = millis();
   uint8_t percent = batteryPercent(readBatteryMv());
   if (percent != batteryLevelChar.value()) batteryLevelChar.writeValue(percent);
+}
+
+// Put the XIAO's onboard 2 MB QSPI flash (P25Q16H) into deep power-down. The firmware doesn't use
+// it, and in standby it draws more than the nRF52840 does asleep. Sends the 0xB9 command by
+// bit-banging SPI mode 0 on the flash pins (P0.21 SCK, P0.25 CS, P0.20 IO0, P0.22 WP, P0.23 HOLD,
+// from the core's variant.cpp). CS is then held HIGH. To use the flash again, send 0xAB first.
+void flashDeepPowerDown() {
+  const uint32_t SCK = 1u << 21, CS = 1u << 25, IO0 = 1u << 20, WP = 1u << 22, HOLD = 1u << 23;
+  NRF_P0->OUTSET = CS | WP | HOLD;
+  NRF_P0->OUTCLR = SCK | IO0;
+  NRF_P0->DIRSET = CS | SCK | IO0 | WP | HOLD;
+  delayMicroseconds(1);
+  NRF_P0->OUTCLR = CS;
+  delayMicroseconds(1);
+  for (int bit = 7; bit >= 0; bit--) {
+    if ((0xB9 >> bit) & 1) NRF_P0->OUTSET = IO0;
+    else NRF_P0->OUTCLR = IO0;
+    delayMicroseconds(1);
+    NRF_P0->OUTSET = SCK;
+    delayMicroseconds(1);
+    NRF_P0->OUTCLR = SCK;
+  }
+  NRF_P0->OUTCLR = IO0;
+  delayMicroseconds(1);
+  NRF_P0->OUTSET = CS;  // the flash enters deep power-down here. The pins stay driven at idle levels.
 }
 
 #ifdef USE_WATCHDOG
@@ -435,8 +504,16 @@ void setup() {
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, HIGH);
 
+  // DC/DC regulator instead of the LDO: about 30-40% less current with the CPU or radio on. The
+  // XIAO has the inductor it needs (Zephyr's xiao_ble board runs REG1 in DC/DC mode).
+  NRF_POWER->DCDCEN = 1;
+  flashDeepPowerDown();
+
 #ifdef PRODUCTION
   enableReadbackProtection();
+  // The core starts USB before setup(). Production boards have no USB access, and with 5 V on the
+  // USB/5V pin the USB peripheral would keep the high-frequency crystal running.
+  PluggableUSBD().deinit();
 #else
   Serial.begin(115200);
 #endif
@@ -449,12 +526,7 @@ void setup() {
   analogReadResolution(12);
 
 #ifdef LATCH_PIN
-  pinMode(LATCH_PIN, INPUT_PULLUP);
-  delay(1);
-  latchClosed = digitalRead(LATCH_PIN) == LOW;
-#endif
-#ifdef TAMPER_PIN
-  pinMode(TAMPER_PIN, INPUT_PULLUP);
+  latchClosed = switchClosed(LATCH_PIN);
 #endif
 
   if (!BLE.begin()) {
@@ -493,17 +565,18 @@ void setup() {
 }
 
 // Everything that runs whether or not something is connected. Sleeps until a BLE event arrives
-// or POLL_MS passes, so the CPU isn't busy all the time.
-void service() {
+// or pollMs passes, so the CPU isn't busy all the time.
+void service(unsigned long pollMs) {
   feedWatchdog();
-  BLE.poll(POLL_MS);
+  BLE.poll(pollMs);
   updateTimers();
   updateSensors();
   updateBattery();
 }
 
 void loop() {
-  service();
+  // Poll fast only while the relock timer is running. A connecting phone wakes BLE.poll() at once.
+  service(unlocked ? POLL_MS : IDLE_POLL_MS);
   BLEDevice central = BLE.central();
 
   if (central) {
@@ -515,7 +588,7 @@ void loop() {
     unsigned long lastUptimeSent = 0;
     unsigned long lastActivity = millis();
     while (central.connected()) {
-      service();
+      service(POLL_MS);
       if (commandChar.written()) {
         handleCommand(central);
         if (lastResult == RES_OK) lastActivity = millis();
