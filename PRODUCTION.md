@@ -1,6 +1,6 @@
 # HeloVT lock: production build, flashing and hardware
 
-Firmware 0.5.0. The app-facing protocol is in [LOCK_SPEC.md](LOCK_SPEC.md).
+Firmware 0.5.1. The app-facing protocol is in [LOCK_SPEC.md](LOCK_SPEC.md).
 
 ## Review status
 
@@ -99,7 +99,7 @@ Check each board:
 1. `nrfjprog --readcode check.hex` fails with a readback-protection error.
 2. With USB plugged in, double-tap reset. No USB drive appears.
 3. In nRF Connect: the board advertises as `Helo-XXXX`, and Device Information shows firmware
-   `0.5.0` (not `-dev` or `-bootloader`).
+   `0.5.1` (not `-dev` or `-bootloader`).
 4. A server-signed unlock works, and D0 measures about 3.3 V while unlocked.
 
 If the board doesn't advertise after step 4, it means the SoftDevice-to-firmware handover assumed

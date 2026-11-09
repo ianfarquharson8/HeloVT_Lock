@@ -57,14 +57,16 @@
 #define USE_WATCHDOG
 #endif
 
-#define FIRMWARE_VERSION "0.5.0"
+#define FIRMWARE_VERSION "0.5.1"
 
 // Optional sensors: a switch from the pin to GND (the pin's internal pull-up is switched on for each
 // read), so a cut wire reads as open. Uncomment the ones that are fitted.
 //   LATCH_PIN:  switch closed = latch/shackle physically engaged
 //   TAMPER_PIN: switch closed = enclosure lid closed
 #define LATCH_PIN D1  // prototype: tactile button, pressed when the lock is closed
-// #define TAMPER_PIN D2
+// #define TAMPER_PIN D3
+// Prototype board: D2 is solder-bridged to D1. Don't use D2 for anything, or it will corrupt the
+// latch reading. Left alone (never configured), D2 stays a disconnected input and is harmless.
 
 // Cut solenoid power as soon as the latch opens, instead of holding it for the full UNLOCK_MS.
 // Saves most of the energy of each unlock. Turn off if the mechanism needs the solenoid held while
@@ -102,6 +104,7 @@
 #define LOG_CHAR_UUID "19b10103-e8f2-537e-4f6c-d104768a1214"
 #define NONCE_CHAR_UUID "19b10104-e8f2-537e-4f6c-d104768a1214"
 #define COMMAND_CHAR_UUID "19b10105-e8f2-537e-4f6c-d104768a1214"
+#define BATTERY_REFRESH_CHAR_UUID "19b10106-e8f2-537e-4f6c-d104768a1214"
 
 const int NONCE_LEN = 16;
 const int MAC_LEN = 32;
@@ -144,6 +147,9 @@ BLEUnsignedLongCharacteristic uptimeChar(UPTIME_CHAR_UUID, BLERead | BLENotify);
 BLECharacteristic logChar(LOG_CHAR_UUID, BLERead, MAX_EVENTS * EVENT_SIZE);
 BLECharacteristic nonceChar(NONCE_CHAR_UUID, BLERead, NONCE_LEN);
 BLECharacteristic commandChar(COMMAND_CHAR_UUID, BLEWrite, COMMAND_LEN);
+// Any write asks for a battery measurement now (the value is ignored). Needs no signature: it only
+// reads the battery, which anyone nearby can already see.
+BLECharacteristic batteryRefreshChar(BATTERY_REFRESH_CHAR_UUID, BLEWrite, 1);
 
 BLEService batteryService("180F");
 BLEUnsignedCharCharacteristic batteryLevelChar("2A19", BLERead | BLENotify);  // percent
@@ -414,15 +420,23 @@ uint8_t batteryPercent(uint16_t mv) {
   return 100;
 }
 
+// Set by a write to Battery Refresh: measure on the next updateBattery() instead of waiting for the
+// period, and notify Battery Level even if it hasn't changed, so the app knows the reading is fresh.
+bool batteryRefreshRequested = false;
+
 void updateBattery() {
   static bool measured = false;
   static unsigned long lastRead = 0;
-  // Skip while the solenoid is on: its current pulls the battery voltage down
-  if (unlocked || (measured && millis() - lastRead < BATTERY_PERIOD_MS)) return;
+  // Skip while the solenoid is on: its current pulls the battery voltage down. A refresh asked for
+  // during an unlock waits until the solenoid is off.
+  if (unlocked) return;
+  if (!batteryRefreshRequested && measured && millis() - lastRead < BATTERY_PERIOD_MS) return;
+  bool forceNotify = batteryRefreshRequested;
+  batteryRefreshRequested = false;
   measured = true;
   lastRead = millis();
   uint8_t percent = batteryPercent(readBatteryMv());
-  if (percent != batteryLevelChar.value()) batteryLevelChar.writeValue(percent);
+  if (forceNotify || percent != batteryLevelChar.value()) batteryLevelChar.writeValue(percent);
 }
 
 // Put the XIAO's onboard 2 MB QSPI flash (P25Q16H) into deep power-down. The firmware doesn't use
@@ -544,6 +558,7 @@ void setup() {
   lockService.addCharacteristic(logChar);
   lockService.addCharacteristic(nonceChar);
   lockService.addCharacteristic(commandChar);
+  lockService.addCharacteristic(batteryRefreshChar);
   BLE.addService(lockService);
   batteryService.addCharacteristic(batteryLevelChar);
   BLE.addService(batteryService);
@@ -592,6 +607,10 @@ void loop() {
       if (commandChar.written()) {
         handleCommand(central);
         if (lastResult == RES_OK) lastActivity = millis();
+      }
+      if (batteryRefreshChar.written()) {
+        batteryRefreshRequested = true;
+        updateBattery();
       }
 
       if (millis() - lastActivity >= IDLE_MS) {

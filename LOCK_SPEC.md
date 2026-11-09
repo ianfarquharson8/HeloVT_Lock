@@ -1,6 +1,6 @@
 # HeloVT lock: BLE spec for the Helo app and server
 
-Firmware 0.5.0. This is the contract between the lock firmware ([xiao_led_ble.ino](xiao_led_ble/xiao_led_ble.ino)),
+Firmware 0.5.1. This is the contract between the lock firmware ([xiao_led_ble.ino](xiao_led_ble/xiao_led_ble.ino)),
 the Helo app and the `lock-sign` server function. Production build, flashing and hardware notes are in
 [PRODUCTION.md](PRODUCTION.md).
 
@@ -66,6 +66,7 @@ as `Helo-XXXX`.
 | Log | `19b10103-e8f2-537e-4f6c-d104768a1214` | read | Oldest first, 5-byte entries `[event type][uint32 ms since boot, LE]`. Last 100 events, in RAM, cleared on reboot. |
 | Nonce | `19b10104-e8f2-537e-4f6c-d104768a1214` | read | 16 bytes |
 | Command | `19b10105-e8f2-537e-4f6c-d104768a1214` | write (with response) | 33 bytes: `[cmd][HMAC-SHA256(key, nonce \|\| cmd)]` |
+| Battery Refresh | `19b10106-e8f2-537e-4f6c-d104768a1214` | write (with response) | 1 byte, value ignored. Asks for a battery measurement now. No signature needed. Since 0.5.1. |
 
 State bytes:
 
@@ -93,18 +94,24 @@ sensor, so tamper reports `0xFF`.
 The lock measures it every 60 s, and not while the solenoid is on. It is a rough estimate. See
 PRODUCTION.md, "Battery" for what it measures and its limits.
 
+To get a reading from right now (firmware 0.5.1 and later), subscribe to Battery Level, then write
+any byte to **Battery Refresh** in the lock service. The lock measures and notifies Battery Level,
+even if the value hasn't changed, usually within about 50 ms. While the solenoid is on, the
+measurement waits until it switches off (up to 5 s). Writing to Battery Refresh doesn't count as
+activity for the 20 s idle disconnect. Older firmware doesn't have the characteristic.
+
 ### Device Information Service `0x180A` (standard)
 
 | Characteristic | UUID | Properties | Value |
 |---|---|---|---|
 | Model Number String | `0x2A24` | read | `HeloVT Lock` |
-| Firmware Revision String | `0x2A26` | read | e.g. `0.5.0` |
+| Firmware Revision String | `0x2A26` | read | e.g. `0.5.1` |
 
 Firmware revision values:
 
-- `0.5.0`: production build, flashed correctly.
-- `0.5.0-dev`: development build. Should never be on a rider's vehicle.
-- `0.5.0-bootloader`: production build on a board that still has the USB bootloader. Anyone with
+- `0.5.1`: production build, flashed correctly.
+- `0.5.1-dev`: development build. Should never be on a rider's vehicle.
+- `0.5.1-bootloader`: production build on a board that still has the USB bootloader. Anyone with
   a USB cable can read its key or flash other firmware. **The server should flag this lock and not
   rent it out.**
 

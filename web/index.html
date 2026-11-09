@@ -1,7 +1,7 @@
 <!doctype html>
 <!--
   Web version of laptop_app.py: unlock the HeloVT lock (XIAO nRF52840) over BLE,
-  and show the board's internal time and its event log.
+  and show its battery level, the board's internal time and its event log.
   Commands are signed with the secret key from lock_key.txt (see xiao_led_ble.ino for the protocol).
   The key is entered on the page and saved in this browser only.
   Uses Web Bluetooth, so it needs Chrome or Edge (Brave needs brave://flags/#brave-web-bluetooth-api).
@@ -51,6 +51,30 @@
   .key-row button { width: auto; margin: 0; padding: 8px 14px; font-size: 0.95rem; }
   .hint { color: gray; font-size: 0.85rem; text-align: left; }
   tr.pending td { font-style: italic; }
+  #battery {
+    display: flex; align-items: center; justify-content: center; gap: 8px;
+    margin: -12px 0 20px; font-variant-numeric: tabular-nums;
+  }
+  #battery[hidden] { display: none; }
+  #battery.stale { opacity: 0.5; }
+  .battery-icon {
+    position: relative; width: 34px; height: 16px; padding: 2px; box-sizing: border-box;
+    border: 2px solid currentColor; border-radius: 4px;
+  }
+  .battery-icon::after {
+    content: ""; position: absolute; right: -5px; top: 3px; width: 3px; height: 6px;
+    background: currentColor; border-radius: 0 2px 2px 0;
+  }
+  #batteryFill { display: block; height: 100%; border-radius: 1px; background: #2e7d32; }
+  #battery.mid #batteryFill { background: #ef6c00; }
+  #battery.low #batteryFill { background: #c62828; }
+  #battery.low #batteryText { color: #c62828; font-weight: 600; }
+  #batteryRefresh {
+    width: auto; margin: 0; padding: 2px 6px; font-size: 1.2rem; line-height: 1;
+    border: none; background: none; color: inherit;
+  }
+  #batteryRefresh.busy { animation: spin 0.8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
 </style>
 </head>
 <body>
@@ -62,6 +86,12 @@
     <button id="saveKey">Save</button>
   </div>
   <p id="status">Disconnected</p>
+  <div id="battery" hidden>
+    <span class="battery-icon" title="Estimated from the battery voltage, measured about once a minute">
+      <span id="batteryFill"></span></span>
+    <span id="batteryText"></span>
+    <button id="batteryRefresh" hidden title="Measure the battery now" aria-label="Measure the battery now">&#x21bb;</button>
+  </div>
   <button id="connect">Connect</button>
   <button id="toggle" disabled>Unlock</button>
   <button id="pickOther" class="link" hidden>Pick a different board</button>
@@ -92,6 +122,11 @@ const UPTIME_CHAR_UUID = "19b10102-e8f2-537e-4f6c-d104768a1214";
 const LOG_CHAR_UUID = "19b10103-e8f2-537e-4f6c-d104768a1214";
 const NONCE_CHAR_UUID = "19b10104-e8f2-537e-4f6c-d104768a1214";
 const COMMAND_CHAR_UUID = "19b10105-e8f2-537e-4f6c-d104768a1214";
+const BATTERY_REFRESH_CHAR_UUID = "19b10106-e8f2-537e-4f6c-d104768a1214";  // firmware 0.5.1+
+// Standard Battery Service (0x180F) / Battery Level (0x2A19), uint8 percent
+const BATTERY_SERVICE = "battery_service";
+const BATTERY_LEVEL_CHAR = "battery_level";
+const BATTERY_LOW = 20, BATTERY_MID = 40;  // percent: red at or below LOW, orange at or below MID
 
 const CMD_LOCK = 0, CMD_UNLOCK = 1;
 const RES_OK = 1;
@@ -116,6 +151,10 @@ const uptimeEl = document.getElementById("uptime");
 const uptimeNoteEl = document.getElementById("uptimeNote");
 const logEl = document.getElementById("log");
 const keyInput = document.getElementById("key");
+const batteryEl = document.getElementById("battery");
+const batteryFillEl = document.getElementById("batteryFill");
+const batteryTextEl = document.getElementById("batteryText");
+const batteryRefreshBtn = document.getElementById("batteryRefresh");
 
 let device = null;
 let nonceChar = null;
@@ -123,6 +162,9 @@ let commandChar = null;
 let unlocked = false;
 let latch = LATCH_NOT_FITTED;
 let hmacKey = null;  // CryptoKey for signing commands
+let batteryPercent = null;  // last battery level read from the board
+let batteryRefreshChar = null;  // null on firmware older than 0.5.1
+let batteryWaiter = null;  // resolves on the next Battery Level notification
 // Resolves when the board notifies State after a command
 let stateWaiter = null;
 
@@ -179,6 +221,14 @@ function formatDuration(ms) {
 function updateToggle() {
   toggleBtn.textContent = unlocked ? "Lock now" : "Unlock";
   toggleBtn.classList.toggle("on", unlocked);
+  updateBatteryRefresh();
+}
+
+// The board doesn't measure while the solenoid is on (it pulls the voltage down), so no refresh then
+function updateBatteryRefresh() {
+  batteryRefreshBtn.hidden = !batteryRefreshChar;
+  batteryRefreshBtn.disabled = unlocked || batteryRefreshBtn.classList.contains("busy");
+  batteryRefreshBtn.title = unlocked ? "Can't measure while unlocked" : "Measure the battery now";
 }
 
 function showState(result) {
@@ -252,6 +302,47 @@ function formatClock(wall) {
 }
 setInterval(tickClock, 100);
 
+// live = false greys it out as the last reading from before a disconnect
+function showBattery(live) {
+  batteryEl.hidden = batteryPercent === null;
+  if (batteryPercent === null) return;
+  batteryFillEl.style.width = `${batteryPercent}%`;
+  batteryEl.classList.toggle("low", batteryPercent <= BATTERY_LOW);
+  batteryEl.classList.toggle("mid", batteryPercent > BATTERY_LOW && batteryPercent <= BATTERY_MID);
+  batteryEl.classList.toggle("stale", !live);
+  batteryTextEl.textContent = `Battery ${batteryPercent}%${live ? "" : " (last reading)"}`;
+}
+
+function onBattery(dataView) {
+  batteryPercent = Math.min(dataView.getUint8(0), 100);
+  showBattery(true);
+  if (batteryWaiter) {
+    batteryWaiter();
+    batteryWaiter = null;
+  }
+}
+
+// Ask the board to measure now. It notifies Battery Level with the new reading even if unchanged.
+async function refreshBattery() {
+  batteryRefreshBtn.classList.add("busy");
+  updateBatteryRefresh();
+  try {
+    const fresh = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("no battery reading from the lock")), 3000);
+      batteryWaiter = () => { clearTimeout(timer); resolve(); };
+    });
+    fresh.catch(() => {});  // awaited below; this only stops a stray warning if the write fails first
+    await batteryRefreshChar.writeValueWithResponse(new Uint8Array([1]));
+    await fresh;
+  } catch (err) {
+    batteryWaiter = null;
+    if (device && device.gatt.connected) setStatus(`Battery: ${err.message}`, "red");
+  } finally {
+    batteryRefreshBtn.classList.remove("busy");
+    updateBatteryRefresh();
+  }
+}
+
 function onUptime(ms) {
   boardUptimeMs = ms;
   boardUptimeAt = performance.now();
@@ -318,11 +409,12 @@ function onDisconnected() {
     renderLog();
   }
 
-  nonceChar = commandChar = null;
-  stateWaiter = null;
+  nonceChar = commandChar = batteryRefreshChar = null;
+  stateWaiter = batteryWaiter = null;
   unlocked = false;
   latch = LATCH_NOT_FITTED;
   updateToggle();
+  showBattery(false);
   toggleBtn.disabled = true;
   connectBtn.textContent = "Reconnect";
   connectBtn.disabled = false;
@@ -348,7 +440,7 @@ async function connect(pickNew) {
       setStatus("Choose the device in the popup...", "orange");
       const picked = await navigator.bluetooth.requestDevice({
         filters: [{ namePrefix: NAME_PREFIX }],
-        optionalServices: [SERVICE_UUID],
+        optionalServices: [SERVICE_UUID, BATTERY_SERVICE],
       });
       if (device) device.removeEventListener("gattserverdisconnected", onDisconnected);
       device = picked;
@@ -378,6 +470,26 @@ async function connect(pickNew) {
     uptimeChar.addEventListener("characteristicvaluechanged",
       (e) => onUptime(e.target.value.getUint32(0, true)));
     await uptimeChar.startNotifications();
+
+    // Battery is optional: a board without the Battery Service still connects, just without it
+    try {
+      const batteryService = await server.getPrimaryService(BATTERY_SERVICE);
+      const batteryChar = await batteryService.getCharacteristic(BATTERY_LEVEL_CHAR);
+      onBattery(await batteryChar.readValue());
+      batteryChar.addEventListener("characteristicvaluechanged", (e) => onBattery(e.target.value));
+      await batteryChar.startNotifications();
+      // The refresh button needs firmware 0.5.1 or later. Without it, the button stays hidden.
+      try {
+        batteryRefreshChar = await service.getCharacteristic(BATTERY_REFRESH_CHAR_UUID);
+      } catch {
+        batteryRefreshChar = null;
+      }
+    } catch {
+      batteryRefreshChar = null;
+      batteryPercent = null;
+      showBattery(false);
+    }
+    updateBatteryRefresh();
 
     toggleBtn.disabled = false;
     connectBtn.textContent = "Disconnect";
@@ -422,6 +534,7 @@ connectBtn.addEventListener("click", () => {
 });
 pickOtherBtn.addEventListener("click", () => connect(true));
 toggleBtn.addEventListener("click", toggle);
+batteryRefreshBtn.addEventListener("click", refreshBattery);
 document.getElementById("saveKey").addEventListener("click", saveKey);
 keyInput.addEventListener("keydown", (e) => { if (e.key === "Enter") saveKey(); });
 document.getElementById("clearLog").addEventListener("click", () => {
